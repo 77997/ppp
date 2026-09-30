@@ -56,6 +56,7 @@ EXTRA_DIST= \
     testsuite/pppfns.py \
     testsuite/00-version_test.py \
     testsuite/auth-chap_test.py \
+    testsuite/auth-lac_test.py \
     testsuite/auth-pap_test.py \
     testsuite/data-transfer_test.py \
     testsuite/link-up_test.py \

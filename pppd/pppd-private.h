@@ -364,6 +364,8 @@ void auth_withpeer_success(int, int, int);
 void auth_check_options(void);
 				/* check authentication options supplied */
 void auth_reset(int);	/* check what secrets we have */
+void auth_lcp_request(int, u_char *, int);
+				/* see a Configure-Request before LCP */
 int  check_passwd(int, char *, int, char *, int, char **);
 				/* Check peer-supplied username/password */
 int  get_secret(int, char *, char *, char *, int *, int);

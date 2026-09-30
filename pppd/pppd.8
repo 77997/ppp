@@ -597,6 +597,36 @@ to 1) if the \fIproxyarp\fR option is used, and will enable the
 dynamic IP address option (i.e. set /proc/sys/net/ipv4/ip_dynaddr to
 1) in demand mode if the local address changes.
 .TP
+.B lac\-password \fIpassword\-string
+Specifies the password to use with the \fBlac\-user\fR name (default
+empty).  It is never looked up in the secrets files, and the LAC may
+receive it in the clear, so it should not be a secret.
+.TP
+.B lac\-user \fIname
+Authenticate to an L2TP access concentrator (LAC) as \fIname\fR, with
+the \fBlac\-password\fR password, and keep the usual credentials, from
+the \fBuser\fR and \fBpassword\fR options, the secrets files or a
+plugin, for the L2TP network server (LNS) behind it.  This is for links
+where the LAC authenticates the user to choose the LNS to tunnel the
+call to, and the LNS then renegotiates LCP and authenticates the user
+again.  The LNS has to send an Endpoint Discriminator that matches
+\fBlns\-endpoint\fR when it renegotiates.
+.IP
+In each LCP negotiation, pppd takes the peer to be the LAC until a
+Configure\-Request from it carries that Endpoint Discriminator.  While
+the peer is the LAC, pppd lets it choose only PAP or CHAP with MD5,
+answers it with the LAC credentials, and after authentication waits for
+the LNS (see \fBlns\-timeout\fR) instead of starting the network
+protocols.  With the LNS, pppd behaves as it would without this option.
+The \fBrefuse\-\fR options and \fBneed\-peer\-eap\fR apply only to the
+LNS.
+.IP
+The Endpoint Discriminator does not authenticate the LNS: this option
+keeps the real credentials out of the LAC's own authentication of the
+user, not away from a LAC that sets out to impersonate the LNS.  The
+LAC also relays the LNS's authentication of the user, so PAP should be
+refused for the LNS.
+.TP
 .B lcp\-echo\-adaptive
 If this option is used with the \fIlcp\-echo\-failure\fR option then
 pppd will send LCP echo\-request frames only if no traffic was received
@@ -645,6 +675,22 @@ file named \fBppp\-\fIname\fB.pid\fR in /var/run (or /etc/ppp on some
 systems) containing its process ID.  This can be useful in determining
 which instance of pppd is responsible for the link to a given peer
 system.  This is a privileged option.
+.TP
+.B lns\-endpoint \fIpattern
+With \fBlac\-user\fR, tells the LNS apart from the LAC: a POSIX
+extended regular expression that the value of a locally assigned
+(class 1) Endpoint Discriminator in the peer's Configure\-Request must
+match as a whole.  For example, \fILNS\-.*\fR matches any value that
+starts with \fILNS\-\fR.  The value is compared as text, so it cannot
+contain a null byte.  One Configure\-Request in a negotiation is
+enough, so an LNS that leaves the option out after pppd rejects it, or
+another option, is still recognised, and \fBnoendpoint\fR does not
+prevent it.  This option is required with \fBlac\-user\fR.
+.TP
+.B lns\-timeout \fIn
+With \fBlac\-user\fR, terminate the link if the LNS has not let pppd
+start the network protocols \fIn\fR seconds (default 30) after LCP
+first came up with the LAC.
 .TP
 .B local
 Don't use the modem control lines.  With this option, pppd will ignore

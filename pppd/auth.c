@@ -77,6 +77,7 @@
 #include <grp.h>
 #include <string.h>
 #include <strings.h>
+#include <regex.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -250,6 +251,10 @@ bool explicit_passwd = 0;	/* Set if "password" option supplied */
 char remote_name[MAXNAMELEN];	/* Peer's name for authentication */
 char path_upapfile[MAXPATHLEN];	/* Pathname of pap-secrets file */
 char path_chapfile[MAXPATHLEN];	/* Pathname of chap-secrets file */
+static char lac_user[MAXNAMELEN]; /* Our name for authenticating to a LAC */
+static char lac_passwd[MAXSECRETLEN]; /* Password for authenticating to a LAC */
+static char lns_endpoint[MAXNAMELEN]; /* Pattern for the LNS's endpoint disc. */
+static int lns_timeout = 30;	/* Seconds to wait for the LNS */
 
 #if defined(PPP_WITH_EAPTLS) || defined(PPP_WITH_PEAP)
 char *cacert_file  = NULL;  /* CA certificate file (pem format) */
@@ -270,11 +275,26 @@ bool need_peer_eap = 0;	    /* Require peer to authenticate us */
 
 static char *uafname;		/* name of most recent +ua file */
 
+/*
+ * With lac-user, the peer is taken to be the LAC until a
+ * Configure-Request in the current LCP negotiation carries an Endpoint
+ * Discriminator that matches lns-endpoint; lns_round is set from then
+ * on.  lns_upap, lns_chap, lns_eap and lns_mdtype hold what the options
+ * allow the LNS, and lns_wait is set while the LNS's deadline runs.
+ */
+static regex_t lns_endpoint_re;
+static bool lns_round;
+static bool lns_wait;
+static bool lns_upap, lns_chap, lns_eap;
+static u_char lns_mdtype;
+
 /* Prototypes for procedures local to this file. */
 
 static void network_phase (int);
 static void check_idle (void *);
 static void connect_time_expired (void *);
+static void lns_timeout_expired (void *);
+static bool lac_round (void);
 static int  null_login (int);
 static int  get_pap_passwd (char *);
 static int  have_pap_secret (int *);
@@ -410,6 +430,22 @@ struct option auth_options[] = {
     { "remotename", o_string, remote_name,
       "Set remote name for authentication", OPT_PRIO | OPT_STATIC,
       &explicit_remote, MAXNAMELEN },
+
+    { "lac-user", o_string, lac_user,
+      "Set name for authentication to a LAC",
+      OPT_PRIO | OPT_STATIC | OPT_INITONLY, NULL, MAXNAMELEN },
+
+    { "lac-password", o_string, lac_passwd,
+      "Set password for authentication to a LAC",
+      OPT_PRIO | OPT_STATIC | OPT_HIDE | OPT_INITONLY, NULL, MAXSECRETLEN },
+
+    { "lns-endpoint", o_string, lns_endpoint,
+      "Set pattern for the LNS's endpoint discriminator",
+      OPT_PRIO | OPT_STATIC | OPT_INITONLY, NULL, MAXNAMELEN },
+
+    { "lns-timeout", o_int, &lns_timeout,
+      "Set time to wait for the LNS",
+      OPT_PRIO | OPT_LLIMIT, NULL, 0, 1 },
 
     { "pap-secrets", o_string, path_upapfile,
       "Set pathname of pap-secrets", OPT_PRIO | OPT_PRIV | OPT_STATIC,
@@ -716,6 +752,10 @@ void start_link(int unit)
 void
 link_terminated(int unit)
 {
+    if (lns_wait) {
+	lns_wait = 0;
+	UNTIMEOUT(lns_timeout_expired, NULL);
+    }
     if (in_phase(PHASE_DEAD) || in_phase(PHASE_MASTER))
 	return;
     new_phase(PHASE_DISCONNECT);
@@ -867,20 +907,30 @@ link_established(int unit)
     }
 
 #ifdef PPP_WITH_EAPTLS
-    if (need_peer_eap && !ao->neg_eap) {
+    /* need-peer-eap is about the LNS; the LAC never gets EAP. */
+    if (need_peer_eap && !lac_round() && !ao->neg_eap) {
 	warn("eap required to authenticate us but no suitable secrets");
 	lcp_close(unit, "couldn't negotiate eap");
 	ppp_set_status(EXIT_AUTH_TOPEER_FAILED);
 	return;
     }
 
-    if (need_peer_eap && !ho->neg_eap) {
+    if (need_peer_eap && !lac_round() && !ho->neg_eap) {
 	warn("peer doesn't want to authenticate us with eap");
 	lcp_close(unit, "couldn't negotiate eap");
 	ppp_set_status(EXIT_PEER_AUTH_FAILED);
 	return;
     }
 #endif
+
+    if (lac_round()) {
+	notice("Peer is not the LNS; using LAC user %q", lac_user);
+	if (!lns_wait) {
+	    lns_wait = 1;
+	    TIMEOUT(lns_timeout_expired, NULL, lns_timeout);
+	}
+    } else if (lac_user[0])
+	notice("Peer is the LNS");
 
     new_phase(PHASE_AUTHENTICATE);
     auth = 0;
@@ -898,8 +948,12 @@ link_established(int unit)
 	eap_authwithpeer(unit, user);
 	auth |= EAP_WITHPEER;
     } else if (ho->neg_chap) {
-	chap_auth_with_peer(unit, user, CHAP_DIGEST(ho->chap_mdtype));
+	chap_auth_with_peer(unit, lac_round()? lac_user: user,
+			    CHAP_DIGEST(ho->chap_mdtype));
 	auth |= CHAP_WITHPEER;
+    } else if (ho->neg_upap && lac_round()) {
+	upap_authwithpeer(unit, lac_user, lac_passwd);
+	auth |= PAP_WITHPEER;
     } else if (ho->neg_upap) {
 	/* If a blank password was explicitly given as an option, trust
 	   the user and don't try to look up one. */
@@ -925,6 +979,20 @@ static void
 network_phase(int unit)
 {
     lcp_options *go = &lcp_gotoptions[unit];
+
+    if (lac_round()) {
+	/*
+	 * Only the LAC has had its say.  Going on would bring the link
+	 * up without the LNS, and with multilink join a bundle keyed on
+	 * the LAC.
+	 */
+	notice("Waiting for the LNS to renegotiate LCP");
+	return;
+    }
+    if (lns_wait) {
+	lns_wait = 0;
+	UNTIMEOUT(lns_timeout_expired, NULL);
+    }
 
     /* Log calling number. */
     if (*remote_number)
@@ -1339,6 +1407,27 @@ connect_time_expired(void *arg)
 }
 
 /*
+ * lns_timeout_expired - the LNS has not brought the link up in time.
+ */
+static void
+lns_timeout_expired(void *arg)
+{
+    lns_wait = 0;
+    error("The LNS did not take over within %d seconds", lns_timeout);
+    ppp_set_status(EXIT_NEGOTIATION_FAILED);
+    lcp_close(0, "No LNS");
+}
+
+/*
+ * lac_round - with lac-user, tell whether the peer is taken to be the LAC.
+ */
+static bool
+lac_round(void)
+{
+    return lac_user[0] != 0 && !lns_round;
+}
+
+/*
  * auth_check_options - called to check authentication options.
  */
 void
@@ -1356,6 +1445,30 @@ auth_check_options(void)
        the user and don't use our_name */
     if (user[0] == 0 && !explicit_user)
 	strlcpy(user, our_name, sizeof(user));
+
+    if (lac_user[0]) {
+	char re[MAXNAMELEN + 4];
+	int err;
+
+	if (lns_endpoint[0] == 0) {
+	    ppp_option_error("lac-user requires lns-endpoint");
+	    exit(EXIT_OPTION_ERROR);
+	}
+	/* The pattern has to match the whole value. */
+	slprintf(re, sizeof(re), "^(%s)$", lns_endpoint);
+	err = regcomp(&lns_endpoint_re, re, REG_EXTENDED | REG_NOSUB);
+	if (err) {
+	    regerror(err, &lns_endpoint_re, re, sizeof(re));
+	    ppp_option_error("lns-endpoint: %s", re);
+	    exit(EXIT_OPTION_ERROR);
+	}
+	/* The refuse-* options have cleared their bits by now. */
+	lns_mdtype = lcp_allowoptions[0].chap_mdtype;
+    } else if (lac_passwd[0] || lns_endpoint[0]) {
+	ppp_option_error("%s requires lac-user",
+			 lac_passwd[0]? "lac-password": "lns-endpoint");
+	exit(EXIT_OPTION_ERROR);
+    }
 
 #if defined(SYSTEM_CA_PATH) && (defined(PPP_WITH_EAPTLS) || defined(PPP_WITH_PEAP))
     /* Use system default for CA Path if not specified */
@@ -1470,6 +1583,22 @@ auth_reset(int unit)
 #endif
 	);
 
+    if (lac_user[0]) {
+	/*
+	 * Until the peer shows that it is the LNS (see auth_lcp_request),
+	 * let it choose only PAP or CHAP with MD5, which any LAC can pass
+	 * on, whatever the refuse-* options say: they are about the LNS.
+	 */
+	lns_round = 0;
+	lns_upap = ao->neg_upap;
+	lns_chap = ao->neg_chap;
+	lns_eap = ao->neg_eap;
+	ao->neg_upap = 1;
+	ao->neg_chap = 1;
+	ao->chap_mdtype = MDTYPE_MD5;
+	ao->neg_eap = 0;
+    }
+
     hadchap = -1;
     if (go->neg_upap && !uselogin && !have_pap_secret(NULL))
 	go->neg_upap = 0;
@@ -1488,6 +1617,43 @@ auth_reset(int unit)
 #endif
 		)
 	go->neg_eap = 0;
+}
+
+/*
+ * auth_lcp_request - called with the options of each Configure-Request
+ * from the peer, before LCP looks at them.  With lac-user, a locally
+ * assigned Endpoint Discriminator whose value matches lns-endpoint
+ * shows that the peer is the LNS: for the rest of this negotiation the
+ * peer may then choose any authentication the options allow, and gets
+ * our own credentials.
+ */
+void
+auth_lcp_request(int unit, u_char *p, int len)
+{
+    lcp_options *ao = &lcp_allowoptions[unit];
+    char value[256];
+    int n;
+
+    if (!lac_round())
+	return;
+    for (; len >= 2 && p[1] >= 2 && p[1] <= len; len -= p[1], p += p[1]) {
+	if (p[0] != CI_EPDISC)
+	    continue;
+	/* Like LCP, look only at the first one. */
+	n = p[1] - 3;
+	if (n < 0 || p[2] != EPD_LOCAL || memchr(p + 3, 0, n) != NULL)
+	    return;
+	memcpy(value, p + 3, n);
+	value[n] = 0;
+	if (regexec(&lns_endpoint_re, value, 0, NULL, 0) != 0)
+	    return;
+	lns_round = 1;
+	ao->neg_upap = lns_upap;
+	ao->neg_chap = lns_chap;
+	ao->chap_mdtype = lns_mdtype;
+	ao->neg_eap = lns_eap;
+	return;
+    }
 }
 
 
@@ -1837,7 +2003,13 @@ get_secret(int unit, char *client, char *server,
     struct wordlist *addrs, *opts;
     char secbuf[MAXWORDLEN];
 
-    if (!am_server && passwd[0] != 0) {
+    if (!am_server && lac_round()) {
+	/*
+	 * Not looked up: the password option, a plugin or a wildcard
+	 * secrets line could give the real secret to the LAC.
+	 */
+	strlcpy(secbuf, lac_passwd, sizeof(secbuf));
+    } else if (!am_server && passwd[0] != 0) {
 	strlcpy(secbuf, passwd, sizeof(secbuf));
     } else if (!am_server && chap_passwd_hook) {
 	if ( (*chap_passwd_hook)(client, secbuf) < 0) {

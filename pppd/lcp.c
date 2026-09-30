@@ -1506,6 +1506,12 @@ lcp_reqci(fsm *f, u_char *inp, int *lenp, int reject_if_disagree)
     BZERO(seenci, sizeof(seenci));
 
     /*
+     * Its Endpoint Discriminator can decide which authentication
+     * protocols we accept, so let auth.c see the request first.
+     */
+    auth_lcp_request(f->unit, inp, l);
+
+    /*
      * Process all his options.
      */
     next = inp;
